@@ -1,0 +1,438 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/nellypoghosyan/ML-FlyRank-AI/blob/main/work/outputs/w05_model_metrics.json\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "LBdy1Tomk15g"
+      },
+      "source": [
+        "# ML-08 — Capstone Modeling Lane\n",
+        "\n",
+        "**Lane:** Refresh / Content Opportunity Scoring  \n",
+        "**Development month:** March 2026  \n",
+        "**Decision moment:** end of 2026-03-21  \n",
+        "**Feature window:** 2026-03-01 → 2026-03-21  \n",
+        "**Outcome window used only as label:** 2026-03-22 → 2026-03-31\n",
+        "\n",
+        "Question: can a learned model rank future-decline cases better than my frozen Week-4 rule on the **same held-out clients** and **same ranking metrics**?\n",
+        "\n",
+        "Frozen Week-4 baseline:\n",
+        "- `impressions_21d >= 500`\n",
+        "- `position_slip >= 2`\n",
+        "- score = `log1p(impressions_21d) * position_slip`"
+      ],
+      "id": "LBdy1Tomk15g"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "E3PjPWLmk15i"
+      },
+      "source": [
+        "## 1. Method choice and why\n",
+        "\n",
+        "This is a binary-label ranking problem. I start with **Logistic Regression** because it is readable and produces ranking scores, then test a small **Random Forest** for nonlinear relationships. Complexity only earns its place if it improves held-out ranking metrics.\n",
+        "\n",
+        "Five pre-decision features:\n",
+        "1. `log_impressions_21d`\n",
+        "2. `ctr_21d`\n",
+        "3. `position_early`\n",
+        "4. `position_recent`\n",
+        "5. `position_slip`\n",
+        "\n",
+        "No IDs, future-window values, or label-derived values are model features."
+      ],
+      "id": "E3PjPWLmk15i"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "9RhZiVavk15k"
+      },
+      "outputs": [],
+      "source": [
+        "!pip -q install duckdb\n",
+        "\n",
+        "import os, json, duckdb, pandas as pd, numpy as np\n",
+        "from IPython.display import display\n",
+        "from sklearn.impute import SimpleImputer\n",
+        "from sklearn.pipeline import make_pipeline\n",
+        "from sklearn.preprocessing import StandardScaler\n",
+        "from sklearn.linear_model import LogisticRegression\n",
+        "from sklearn.ensemble import RandomForestClassifier\n",
+        "from sklearn.model_selection import GroupShuffleSplit\n",
+        "from sklearn.metrics import roc_auc_score, average_precision_score, precision_score, recall_score, confusion_matrix\n",
+        "from sklearn.inspection import permutation_importance\n",
+        "\n",
+        "RANDOM_STATE = 42\n",
+        "\n",
+        "from google.colab import userdata\n",
+        "HF_TOKEN = userdata.get(\"HF_TOKEN\")\n",
+        "if not HF_TOKEN:\n",
+        "    raise RuntimeError(\"Add Colab Secret HF_TOKEN and allow notebook access.\")\n",
+        "\n",
+        "con = duckdb.connect()\n",
+        "safe_token = HF_TOKEN.replace(\"'\", \"''\")\n",
+        "con.execute(f\"CREATE OR REPLACE SECRET hf_secret (TYPE huggingface, TOKEN '{safe_token}')\")\n",
+        "\n",
+        "BASE=\"hf://datasets/FlyRank/internship-warehouse\"\n",
+        "MARCH=f\"{BASE}/fact_content_daily_performance/month=2026-03/*.parquet\"\n",
+        "FEATURE_START=\"2026-03-01\"; EARLY_END=\"2026-03-10\"; RECENT_START=\"2026-03-11\"\n",
+        "DECISION_DATE=\"2026-03-21\"; OUTCOME_START=\"2026-03-22\"; OUTCOME_END=\"2026-03-31\"\n",
+        "\n",
+        "print(\"Connected.\")\n",
+        "print(\"Random seed:\", RANDOM_STATE)"
+      ],
+      "id": "9RhZiVavk15k"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "xFZCOGRmk15m"
+      },
+      "outputs": [],
+      "source": [
+        "frame_sql=f\"\"\"\n",
+        "WITH agg AS (\n",
+        "SELECT client_hash_id, content_hash_id,\n",
+        " SUM(gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{FEATURE_START}' AND DATE '{DECISION_DATE}') AS impressions_21d,\n",
+        " SUM(gsc_clicks) FILTER (WHERE report_date BETWEEN DATE '{FEATURE_START}' AND DATE '{DECISION_DATE}') AS clicks_21d,\n",
+        " SUM(gsc_avg_position*gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{FEATURE_START}' AND DATE '{EARLY_END}' AND gsc_impressions>0 AND gsc_avg_position>0)\n",
+        " / NULLIF(SUM(gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{FEATURE_START}' AND DATE '{EARLY_END}' AND gsc_impressions>0 AND gsc_avg_position>0),0) AS position_early,\n",
+        " SUM(gsc_avg_position*gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{RECENT_START}' AND DATE '{DECISION_DATE}' AND gsc_impressions>0 AND gsc_avg_position>0)\n",
+        " / NULLIF(SUM(gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{RECENT_START}' AND DATE '{DECISION_DATE}' AND gsc_impressions>0 AND gsc_avg_position>0),0) AS position_recent,\n",
+        " AVG(gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{FEATURE_START}' AND DATE '{DECISION_DATE}') AS past_avg_daily_impressions,\n",
+        " AVG(gsc_impressions) FILTER (WHERE report_date BETWEEN DATE '{OUTCOME_START}' AND DATE '{OUTCOME_END}') AS future_avg_daily_impressions\n",
+        "FROM read_parquet('{MARCH}')\n",
+        "GROUP BY 1,2\n",
+        ")\n",
+        "SELECT client_hash_id, content_hash_id, impressions_21d, clicks_21d,\n",
+        " LN(1+impressions_21d) AS log_impressions_21d,\n",
+        " CASE WHEN impressions_21d>0 THEN 1.0*clicks_21d/impressions_21d END AS ctr_21d,\n",
+        " position_early, position_recent,\n",
+        " position_recent-position_early AS position_slip,\n",
+        " CASE WHEN impressions_21d>=100 AND past_avg_daily_impressions>0\n",
+        "       AND future_avg_daily_impressions IS NOT NULL\n",
+        "       AND future_avg_daily_impressions < 0.80*past_avg_daily_impressions\n",
+        "      THEN 1 ELSE 0 END AS future_decline_label\n",
+        "FROM agg\n",
+        "WHERE impressions_21d>=100\n",
+        " AND position_early IS NOT NULL\n",
+        " AND position_recent IS NOT NULL\n",
+        " AND past_avg_daily_impressions>0\n",
+        " AND future_avg_daily_impressions IS NOT NULL\n",
+        "\"\"\"\n",
+        "df=con.sql(frame_sql).df()\n",
+        "\n",
+        "FEATURES=[\"log_impressions_21d\",\"ctr_21d\",\"position_early\",\"position_recent\",\"position_slip\"]\n",
+        "LABEL=\"future_decline_label\"; GROUP=\"client_hash_id\"\n",
+        "FORBIDDEN={\"future_decline_label\",\"future_avg_daily_impressions\",\"future_drop_ratio\",\"trend_pct\",\"trend_direction\",\"client_hash_id\",\"content_hash_id\"}\n",
+        "assert not (set(FEATURES)&FORBIDDEN)\n",
+        "\n",
+        "print(\"Rows:\", f\"{len(df):,}\", \"| clients:\", df[GROUP].nunique(), \"| base rate:\", round(df[LABEL].mean(),4))\n",
+        "print(\"Leakage guard:\", set(FEATURES)&FORBIDDEN)\n",
+        "display(df[[\"client_hash_id\",\"content_hash_id\"]+FEATURES+[LABEL]].head())"
+      ],
+      "id": "xFZCOGRmk15m"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "1kYzFmIzk15n"
+      },
+      "source": [
+        "## 2. Split design\n",
+        "\n",
+        "I hold out whole clients with `GroupShuffleSplit` (80% train / 20% test). This is more honest than a random row split because pages from the same client can share site-level behavior. `client_hash_id` is used only for splitting, never as a feature."
+      ],
+      "id": "1kYzFmIzk15n"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "mpCxbkXCk15n"
+      },
+      "outputs": [],
+      "source": [
+        "splitter=GroupShuffleSplit(n_splits=1,test_size=0.20,random_state=RANDOM_STATE)\n",
+        "train_idx,test_idx=next(splitter.split(df[FEATURES],df[LABEL],groups=df[GROUP]))\n",
+        "train=df.iloc[train_idx].copy(); test=df.iloc[test_idx].copy()\n",
+        "\n",
+        "assert set(train[GROUP]).isdisjoint(set(test[GROUP]))\n",
+        "print(\"Train rows:\",f\"{len(train):,}\",\"Test rows:\",f\"{len(test):,}\")\n",
+        "print(\"Train clients:\",train[GROUP].nunique(),\"Test clients:\",test[GROUP].nunique())\n",
+        "print(\"Client overlap:\",len(set(train[GROUP])&set(test[GROUP])))\n",
+        "print(\"Train base rate:\",round(train[LABEL].mean(),4),\"Test base rate:\",round(test[LABEL].mean(),4))"
+      ],
+      "id": "mpCxbkXCk15n"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "iYvDyMyfk15n"
+      },
+      "source": [
+        "## 3. Train + compare vs my baseline\n",
+        "\n",
+        "The Week-4 rule is reapplied **unchanged** to the held-out test rows. Both models and baseline are compared with `Precision@10` and `Precision@50`; the base rate appears in the same table. Learned models also report ROC-AUC and Average Precision."
+      ],
+      "id": "iYvDyMyfk15n"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "-N6aV3iJk15o"
+      },
+      "outputs": [],
+      "source": [
+        "MIN_IMPRESSIONS=500; MIN_POSITION_SLIP=2.0\n",
+        "test[\"baseline_flag\"]=(test[\"impressions_21d\"]>=MIN_IMPRESSIONS)&(test[\"position_slip\"]>=MIN_POSITION_SLIP)\n",
+        "test[\"baseline_score\"]=np.where(test[\"baseline_flag\"],np.log1p(test[\"impressions_21d\"])*test[\"position_slip\"],0.0)\n",
+        "\n",
+        "X_train=train[FEATURES]; y_train=train[LABEL]\n",
+        "X_test=test[FEATURES]; y_test=test[LABEL]\n",
+        "\n",
+        "logit=make_pipeline(SimpleImputer(strategy=\"median\"),StandardScaler(),\n",
+        "                    LogisticRegression(max_iter=2000,random_state=RANDOM_STATE))\n",
+        "rf=make_pipeline(SimpleImputer(strategy=\"median\"),\n",
+        "                 RandomForestClassifier(n_estimators=250,max_depth=6,min_samples_leaf=30,\n",
+        "                                        class_weight=\"balanced\",random_state=RANDOM_STATE,n_jobs=-1))\n",
+        "logit.fit(X_train,y_train); rf.fit(X_train,y_train)\n",
+        "test[\"logit_score\"]=logit.predict_proba(X_test)[:,1]\n",
+        "test[\"rf_score\"]=rf.predict_proba(X_test)[:,1]"
+      ],
+      "id": "-N6aV3iJk15o"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "ZtvK1Ibjk15o"
+      },
+      "outputs": [],
+      "source": [
+        "def p_at_k(frame,score_col,k,eligible=None):\n",
+        "    x=frame.copy()\n",
+        "    if eligible is not None: x=x.loc[eligible(x)]\n",
+        "    if len(x)==0: return np.nan\n",
+        "    x=x.sort_values(score_col,ascending=False)\n",
+        "    return float(x.head(min(k,len(x)))[LABEL].mean())\n",
+        "\n",
+        "base=float(test[LABEL].mean())\n",
+        "rows=[\n",
+        " {\"method\":\"Base rate\",\"Precision@10\":base,\"Precision@50\":base,\"ROC_AUC\":np.nan,\"Average_Precision\":base},\n",
+        " {\"method\":\"Week-4 frozen rule\",\"Precision@10\":p_at_k(test,\"baseline_score\",10,lambda x:x[\"baseline_flag\"]),\n",
+        "  \"Precision@50\":p_at_k(test,\"baseline_score\",50,lambda x:x[\"baseline_flag\"]),\"ROC_AUC\":np.nan,\"Average_Precision\":np.nan},\n",
+        " {\"method\":\"Logistic Regression\",\"Precision@10\":p_at_k(test,\"logit_score\",10),\"Precision@50\":p_at_k(test,\"logit_score\",50),\n",
+        "  \"ROC_AUC\":roc_auc_score(y_test,test[\"logit_score\"]),\"Average_Precision\":average_precision_score(y_test,test[\"logit_score\"])},\n",
+        " {\"method\":\"Random Forest\",\"Precision@10\":p_at_k(test,\"rf_score\",10),\"Precision@50\":p_at_k(test,\"rf_score\",50),\n",
+        "  \"ROC_AUC\":roc_auc_score(y_test,test[\"rf_score\"]),\"Average_Precision\":average_precision_score(y_test,test[\"rf_score\"])}\n",
+        "]\n",
+        "comparison=pd.DataFrame(rows)\n",
+        "display(comparison.round(4))\n",
+        "\n",
+        "model_rows=comparison[comparison[\"method\"].isin([\"Logistic Regression\",\"Random Forest\"])]\n",
+        "best_row=model_rows.sort_values([\"Precision@50\",\"Precision@10\"],ascending=False).iloc[0]\n",
+        "best_name=best_row[\"method\"]\n",
+        "best_model=logit if best_name==\"Logistic Regression\" else rf\n",
+        "best_score_col=\"logit_score\" if best_name==\"Logistic Regression\" else \"rf_score\"\n",
+        "print(\"Selected model:\",best_name)\n",
+        "print(\"Selection rule: highest held-out Precision@50, Precision@10 as tie-breaker.\")"
+      ],
+      "id": "ZtvK1Ibjk15o"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "Dp5kfpzgk15p"
+      },
+      "source": [
+        "The baseline is allowed to win. I do not add complexity just to force a better headline result. For this lane, Precision@50 is the primary queue metric; Precision@10 is a useful but noisier view of the very top of the ranking."
+      ],
+      "id": "Dp5kfpzgk15p"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "16kwgvlKk15p"
+      },
+      "source": [
+        "## 4. Errors and interpretation\n",
+        "\n",
+        "I inspect held-out permutation importance, diagnostic classification errors at a 0.50 threshold, error rates by traffic and position-movement buckets, and concrete false positives/false negatives. The production use remains ranking by score, not a 0.50 cutoff."
+      ],
+      "id": "16kwgvlKk15p"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "iggmztD4k15q"
+      },
+      "outputs": [],
+      "source": [
+        "perm=permutation_importance(best_model,X_test,y_test,n_repeats=8,random_state=RANDOM_STATE,\n",
+        "                            scoring=\"average_precision\",n_jobs=-1)\n",
+        "importance=(pd.DataFrame({\"feature\":FEATURES,\"importance_mean\":perm.importances_mean,\n",
+        "                          \"importance_std\":perm.importances_std})\n",
+        "            .sort_values(\"importance_mean\",ascending=False).reset_index(drop=True))\n",
+        "display(importance.round(5))\n",
+        "print(\"Top 3 features:\")\n",
+        "for i,row in importance.head(3).iterrows():\n",
+        "    print(f\"{i+1}. {row['feature']} — {row['importance_mean']:.5f}\")"
+      ],
+      "id": "iggmztD4k15q"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "lXywZYX7k15q"
+      },
+      "outputs": [],
+      "source": [
+        "test[\"best_pred\"]=(test[best_score_col]>=0.50).astype(int)\n",
+        "tn,fp,fn,tp=confusion_matrix(test[LABEL],test[\"best_pred\"]).ravel()\n",
+        "print({\"TN\":int(tn),\"FP\":int(fp),\"FN\":int(fn),\"TP\":int(tp)})\n",
+        "print(\"Diagnostic precision:\",round(precision_score(test[LABEL],test[\"best_pred\"],zero_division=0),4))\n",
+        "print(\"Diagnostic recall:\",round(recall_score(test[LABEL],test[\"best_pred\"],zero_division=0),4))\n",
+        "\n",
+        "a=test.copy()\n",
+        "a[\"volume_bucket\"]=pd.qcut(a[\"impressions_21d\"],4,labels=[\"Q1_low\",\"Q2\",\"Q3\",\"Q4_high\"],duplicates=\"drop\")\n",
+        "a[\"slip_bucket\"]=pd.cut(a[\"position_slip\"],[-np.inf,-2,0,2,5,np.inf],\n",
+        " labels=[\"improved_2plus\",\"improved_small\",\"stable_to_2\",\"slipped_2_to_5\",\"slipped_5plus\"])\n",
+        "a[\"is_error\"]=(a[\"best_pred\"]!=a[LABEL]).astype(int)\n",
+        "\n",
+        "err_vol=a.groupby(\"volume_bucket\",observed=True).agg(n=(LABEL,\"size\"),error_rate=(\"is_error\",\"mean\"),positive_rate=(LABEL,\"mean\")).reset_index()\n",
+        "err_slip=a.groupby(\"slip_bucket\",observed=True).agg(n=(LABEL,\"size\"),error_rate=(\"is_error\",\"mean\"),positive_rate=(LABEL,\"mean\")).reset_index()\n",
+        "\n",
+        "print(\"Errors by volume\"); display(err_vol.round(4))\n",
+        "print(\"Errors by position movement\"); display(err_slip.round(4))"
+      ],
+      "id": "lXywZYX7k15q"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "P97DPoKhk15q"
+      },
+      "outputs": [],
+      "source": [
+        "fp3=test[(test[\"best_pred\"]==1)&(test[LABEL]==0)].sort_values(best_score_col,ascending=False).head(3)\n",
+        "fn3=test[(test[\"best_pred\"]==0)&(test[LABEL]==1)].sort_values(best_score_col,ascending=True).head(3)\n",
+        "cols=[\"client_hash_id\",\"content_hash_id\",\"impressions_21d\",\"ctr_21d\",\"position_early\",\"position_recent\",\"position_slip\",LABEL,best_score_col]\n",
+        "\n",
+        "print(\"Three high-confidence false positives\"); display(fp3[cols].round(4))\n",
+        "print(\"Three high-confidence false negatives\"); display(fn3[cols].round(4))\n",
+        "\n",
+        "wv=err_vol.sort_values(\"error_rate\",ascending=False).iloc[0]\n",
+        "ws=err_slip.sort_values(\"error_rate\",ascending=False).iloc[0]\n",
+        "print(f\"Highest error-rate volume bucket: {wv['volume_bucket']} (n={int(wv['n'])}, error={wv['error_rate']:.3f})\")\n",
+        "print(f\"Highest error-rate movement bucket: {ws['slip_bucket']} (n={int(ws['n'])}, error={ws['error_rate']:.3f})\")\n",
+        "print(\"These are observed error patterns, not causal explanations.\")"
+      ],
+      "id": "P97DPoKhk15q"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "fKDO-lgdk15r"
+      },
+      "source": [
+        "### Interpretation boundaries\n",
+        "\n",
+        "Permutation importance shows what the fitted model relies on for prediction, not what causes decline. False positives and false negatives are also partly errors against a proxy label based on future impressions, so disagreement does not automatically mean the model is “wrong” in a business sense."
+      ],
+      "id": "fKDO-lgdk15r"
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "0uJ4la3Hk15r"
+      },
+      "outputs": [],
+      "source": [
+        "os.makedirs(\"work/outputs\",exist_ok=True)\n",
+        "receipt={\n",
+        " \"lane\":\"Refresh / Content Opportunity Scoring\",\n",
+        " \"split\":\"GroupShuffleSplit by client_hash_id, 80/20\",\n",
+        " \"random_state\":RANDOM_STATE,\n",
+        " \"test_rows\":int(len(test)),\n",
+        " \"test_clients\":int(test[GROUP].nunique()),\n",
+        " \"test_base_rate\":base,\n",
+        " \"baseline_precision_at_10\":float(comparison.loc[comparison.method==\"Week-4 frozen rule\",\"Precision@10\"].iloc[0]),\n",
+        " \"baseline_precision_at_50\":float(comparison.loc[comparison.method==\"Week-4 frozen rule\",\"Precision@50\"].iloc[0]),\n",
+        " \"selected_model\":best_name,\n",
+        " \"selected_model_precision_at_10\":float(best_row[\"Precision@10\"]),\n",
+        " \"selected_model_precision_at_50\":float(best_row[\"Precision@50\"]),\n",
+        " \"selected_model_roc_auc\":float(best_row[\"ROC_AUC\"]),\n",
+        " \"selected_model_average_precision\":float(best_row[\"Average_Precision\"]),\n",
+        " \"features\":FEATURES\n",
+        "}\n",
+        "with open(\"work/outputs/w05_model_metrics.json\",\"w\") as f: json.dump(receipt,f,indent=2)\n",
+        "print(\"Wrote work/outputs/w05_model_metrics.json\")"
+      ],
+      "id": "0uJ4la3Hk15r"
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "k-G8wCR_k15r"
+      },
+      "source": [
+        "## 5. Self-check\n",
+        "\n",
+        "- [ ] Method choice fits a binary ranking problem.\n",
+        "- [ ] Split holds out whole clients.\n",
+        "- [ ] Random seed is fixed.\n",
+        "- [ ] Week-4 baseline thresholds are unchanged.\n",
+        "- [ ] Baseline and models use the same held-out rows.\n",
+        "- [ ] Base rate, Precision@10 and Precision@50 appear in one table.\n",
+        "- [ ] Learned models also report ROC-AUC and Average Precision.\n",
+        "- [ ] Complexity does not win automatically.\n",
+        "- [ ] Permutation importance is computed on held-out data.\n",
+        "- [ ] Top three features are printed.\n",
+        "- [ ] Error rates are inspected by two value ranges.\n",
+        "- [ ] Three false positives and three false negatives are shown.\n",
+        "- [ ] IDs are not model features.\n",
+        "- [ ] No future-window or label-derived input is used as a feature.\n",
+        "- [ ] `work/outputs/w05_model_metrics.json` is written.\n",
+        "- [ ] Notebook runs top-to-bottom with no errors.\n",
+        "- [ ] Saved as `work/notebooks/w05_model.ipynb`."
+      ],
+      "id": "k-G8wCR_k15r"
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "colab": {
+      "provenance": [],
+      "include_colab_link": true
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}
