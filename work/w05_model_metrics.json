@@ -1,0 +1,22 @@
+{
+  "lane": "Refresh / Content Opportunity Scoring",
+  "split": "GroupShuffleSplit by client_hash_id, 80/20",
+  "random_state": 42,
+  "test_rows": 28119,
+  "test_clients": 8,
+  "test_base_rate": 0.32387353746577047,
+  "baseline_precision_at_10": 0.5,
+  "baseline_precision_at_50": 0.64,
+  "selected_model": "Random Forest",
+  "selected_model_precision_at_10": 0.3,
+  "selected_model_precision_at_50": 0.28,
+  "selected_model_roc_auc": 0.6308504917262152,
+  "selected_model_average_precision": 0.40802616393374835,
+  "features": [
+    "log_impressions_21d",
+    "ctr_21d",
+    "position_early",
+    "position_recent",
+    "position_slip"
+  ]
+}
